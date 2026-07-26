@@ -1058,7 +1058,9 @@ def _start_router(
         router_args.prefill_urls = prefill_urls
         router_args.decode_urls = decode_urls
 
-    # We will not use the circuit breaker from router.
+    # Disable circuit breaker to prevent RDMA transfer timeouts from
+    # marking workers as dead. Timeouts are transient (PCIe contention under
+    # high load) and do not indicate a dead server.
     router_args.disable_circuit_breaker = True
 
     logger.info(f"Launch router with args: {router_args}")
