@@ -5,6 +5,7 @@ import multiprocessing
 import os
 import random
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -15,13 +16,14 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from vime.backends.vllm_utils.external import start_external_rollout_servers
 from vime.backends.vllm_utils.vllm_config import ModelConfig, ServerGroupConfig, VllmConfig
-from vime.backends.vllm_utils.vllm_engine import VLLMEngine
+from vime.backends.vllm_utils.vllm_engine import VLLMEngine, _resolve_parallel_sizes
 
 # Memory-type tag strings shared with the vLLM engine's sleep/wake_up API.
 GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
 GPU_MEMORY_TYPE_WEIGHTS = "weights"
 GPU_MEMORY_TYPE_CUDA_GRAPH = "cuda_graph"
 from vime.rollout.base_types import call_rollout_fn
+from vime.rollout.sample_hooks import set_current_rollout_id
 from vime.utils import logging_utils
 from vime.utils.data import get_source
 from vime.utils.dp_schedule import build_dp_schedule
@@ -107,6 +109,43 @@ def _tensorize_rollout_data_for_training(rollout_data: dict[str, Any]) -> None:
         )
 
 
+def _validate_rollout_routed_experts_for_replay(
+    routed_experts: list[torch.Tensor],
+    args,
+) -> None:
+    """Reject incomplete PP routing captures before R3 consumes them."""
+    if not routed_experts:
+        raise ValueError("R3 is enabled but no rollout routed-experts tensors were returned.")
+
+    num_layers = int(args.num_layers)
+    topk = int(args.moe_router_topk)
+    moe_layer_freq = getattr(args, "moe_layer_freq", None)
+    if isinstance(moe_layer_freq, (list, tuple)):
+        moe_layers = [layer_id for layer_id, freq in enumerate(moe_layer_freq[:num_layers]) if int(freq) != 0]
+    else:
+        moe_layers = list(range(num_layers))
+
+    for sample_idx, experts in enumerate(routed_experts):
+        experts = torch.as_tensor(experts)
+        if experts.ndim != 3 or tuple(experts.shape[1:]) != (num_layers, topk):
+            raise ValueError(
+                "Invalid rollout routed-experts shape for R3: "
+                f"sample={sample_idx}, got={tuple(experts.shape)}, "
+                f"expected=(*, {num_layers}, {topk})."
+            )
+        if experts.shape[0] == 0:
+            raise ValueError(f"R3 sample {sample_idx} has no routed-experts rows.")
+        if topk > 1:
+            missing_layers = [layer_id for layer_id in moe_layers if not torch.count_nonzero(experts[:, layer_id, :])]
+            if missing_layers:
+                raise ValueError(
+                    "R3 routed-experts capture is all zero for MoE layers "
+                    f"{missing_layers} in sample {sample_idx}. This usually means "
+                    "VLLM pipeline stages did not aggregate their disjoint routing "
+                    "captures; refusing to replay expert 0 everywhere."
+                )
+
+
 @dataclasses.dataclass
 class ServerGroup:
     """A group of homogeneous vLLM engines with the same configuration.
@@ -138,6 +177,29 @@ class ServerGroup:
     def engines(self):
         """Node-0 engines only (for multi-node serving)."""
         return self.all_engines[:: self.nodes_per_engine]
+
+    def parallel_config(self) -> dict[str, Any]:
+        """Return the VLLM parallel args that affect rank-local expert routing."""
+        overrides = {key.replace("-", "_"): value for key, value in self.vllm_overrides.items()}
+        tp_size, pp_size, pcp_size, dp_size = _resolve_parallel_sizes(
+            self.args,
+            gpus_per_engine=self.num_gpus_per_engine,
+            overrides=overrides,
+        )
+        enable_expert_parallel = bool(
+            overrides.get(
+                "enable_expert_parallel",
+                getattr(self.args, "vllm_enable_expert_parallel", False),
+            )
+        )
+        return {
+            "tp_size": tp_size,
+            "pp_size": pp_size,
+            "pcp_size": pcp_size,
+            "dp_size": dp_size,
+            "enable_expert_parallel": enable_expert_parallel,
+            "ep_size": tp_size * pcp_size * dp_size if enable_expert_parallel else 1,
+        }
 
     def start_engines(self, port_cursors: dict[int, int] | None = None) -> tuple[list, dict[int, int]]:
         """Create Ray actors, allocate ports, and fire ``engine.init()`` without waiting.
@@ -316,6 +378,11 @@ class RolloutServer:
             for j in range(len(g.engines)):
                 offsets.append(g.gpu_offset + j * g.num_gpus_per_engine)
         return offsets
+
+    @property
+    def engine_parallel_configs(self) -> list[dict[str, Any]]:
+        """Per-engine VLLM parallel config, parallel to ``engines``."""
+        return [g.parallel_config() for g in self.server_groups for _ in g.engines]
 
     @property
     def nodes_per_engine(self):
@@ -545,8 +612,9 @@ class RolloutManager:
         engines = srv.engines if srv else []
         gpu_counts = srv.engine_gpu_counts if srv else []
         gpu_offsets = srv.engine_gpu_offsets if srv else []
+        parallel_configs = srv.engine_parallel_configs if srv else []
         num_new = srv.num_new_engines if srv else 0
-        return engines, self.rollout_engine_lock, num_new, gpu_counts, gpu_offsets
+        return engines, self.rollout_engine_lock, num_new, gpu_counts, gpu_offsets, parallel_configs
 
     def get_num_rollout_per_epoch(self):
         assert self.args.rollout_global_dataset
@@ -555,6 +623,7 @@ class RolloutManager:
     def generate(self, rollout_id):
         start_time = time.time()
         self.rollout_id = rollout_id
+        set_current_rollout_id(rollout_id)
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
@@ -571,6 +640,7 @@ class RolloutManager:
         if self.args.debug_train_only:
             # if debug train only, we don't generate evaluation data
             return
+        set_current_rollout_id(rollout_id)
         self.health_monitoring_resume()
 
         result = call_rollout_fn(self.eval_generate_rollout, self.args, rollout_id, self.data_source, evaluation=True)
@@ -809,7 +879,10 @@ class RolloutManager:
             train_data["rollout_top_p_token_offsets"] = [sample.rollout_top_p_token_offsets for sample in samples]
 
         if samples[0].rollout_routed_experts is not None:
-            train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
+            routed_experts = [torch.as_tensor(sample.rollout_routed_experts) for sample in samples]
+            if getattr(self.args, "use_rollout_routing_replay", False):
+                _validate_rollout_routed_experts_for_replay(routed_experts, self.args)
+            train_data["rollout_routed_experts"] = routed_experts
 
         if samples[0].train_metadata is not None:
             train_data["metadata"] = [sample.train_metadata for sample in samples]
@@ -1027,7 +1100,7 @@ def _start_router(
     bind: tuple[str, int] | None = None,
     prefill_urls: list | None = None,
     decode_urls: list | None = None,
-) -> tuple[str, int, int]:
+) -> tuple[str, int, int | None]:
     """Start the rollout HTTP gateway (vllm-router)."""
     if bind is not None:
         router_ip, router_port = bind
@@ -1058,7 +1131,9 @@ def _start_router(
         router_args.prefill_urls = prefill_urls
         router_args.decode_urls = decode_urls
 
-    # We will not use the circuit breaker from router.
+    # Disable circuit breaker to prevent RDMA transfer timeouts from
+    # marking workers as dead. Timeouts are transient (PCIe contention under
+    # high load) and do not indicate a dead server.
     router_args.disable_circuit_breaker = True
 
     logger.info(f"Launch router with args: {router_args}")
@@ -1108,6 +1183,7 @@ def start_rollout_servers(args, pg) -> tuple[dict[str, Any], list[Any]]:
     config = _resolve_vllm_config(args)
 
     servers: dict[str, RolloutServer] = {}
+    encoder_metadata: dict[str, tuple[str, list[str]]] = {}
     pending_init_handles: list[Any] = []
     gpu_offset = 0
     engine_offset = 0
@@ -1191,35 +1267,44 @@ def start_rollout_servers(args, pg) -> tuple[dict[str, Any], list[Any]]:
             return group
 
         if has_epd:
-            # --- Phase 1: start encoder groups, wait, collect URLs ---
-            # Encoder URLs are injected into the non-encoder workers' server args,
-            # so this phase must stay synchronous even though final LLM init is deferred.
-            encoder_urls: list[str] = []
+            overrides_extra = {
+                "ec_transfer_config": {
+                    "ec_connector_extra_config": {
+                        "shared_storage_path": f"/dev/shm/vime-ec-{uuid.uuid4().hex}",
+                    },
+                },
+            }
+            encoder_endpoints: list[str] = []
             for group_cfg in model_cfg.server_groups:
                 if group_cfg.worker_type != "encoder":
                     continue
-                group = _make_group(group_cfg, engine_router_ip, engine_router_port)
+                group = _make_group(group_cfg, engine_router_ip, engine_router_port, overrides_extra)
                 handles, port_cursors = group.start_engines(port_cursors)
                 if handles:
                     ray.get(handles)
-                urls = ray.get([e.get_url.remote() for e in group.engines])
-                encoder_urls.extend(u for u in urls if u is not None)
+                endpoints = ray.get([engine.get_url.remote() for engine in group.engines])
+                encoder_endpoints.extend(endpoint for endpoint in endpoints if endpoint is not None)
                 server_groups.append(group)
 
-            logger.info(f"EPD phase 1 done: collected {len(encoder_urls)} encoder URLs: {encoder_urls}")
+            logger.info("EPD phase 1 done: collected %d encoder endpoints", len(encoder_endpoints))
 
-            # --- Phase 2: start non-encoder groups, injecting encoder URLs into
-            # language-only LLM workers. Prefill groups use this for full EPD,
-            # while regular groups allow encoder/LLM split without PD.
             non_encoder_handles: list = []
             for group_cfg in model_cfg.server_groups:
                 if group_cfg.worker_type == "encoder":
                     continue
-                overrides_extra = {}
-                if encoder_urls and group_cfg.worker_type in ("prefill", "regular"):
-                    overrides_extra["language_only"] = True
-                    overrides_extra["encoder_urls"] = encoder_urls
-                group = _make_group(group_cfg, engine_router_ip, engine_router_port, overrides_extra=overrides_extra)
+                non_encoder_overrides = overrides_extra if group_cfg.worker_type in ("regular", "prefill") else None
+                if non_encoder_overrides is not None and encoder_endpoints:
+                    non_encoder_overrides = {
+                        **overrides_extra,
+                        "language_only": True,
+                        "encoder_urls": encoder_endpoints,
+                    }
+                group = _make_group(
+                    group_cfg,
+                    engine_router_ip,
+                    engine_router_port,
+                    non_encoder_overrides,
+                )
                 handles, port_cursors = group.start_engines(port_cursors)
                 non_encoder_handles.extend(handles)
                 server_groups.append(group)
@@ -1267,9 +1352,12 @@ def start_rollout_servers(args, pg) -> tuple[dict[str, Any], list[Any]]:
             update_weights=model_cfg.update_weights,
             prometheus_port=prom_port,
         )
+        if has_epd:
+            encoder_metadata[model_cfg.name] = (server_groups[0].model_path, encoder_endpoints)
 
     # Expose per-model router info for custom rollout functions.
     args.vllm_model_routers = {name: (srv.router_ip, srv.router_port) for name, srv in servers.items()}
+    args.vllm_model_encoder_endpoints = encoder_metadata
 
     return servers, pending_init_handles
 

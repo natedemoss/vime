@@ -46,7 +46,7 @@ _ALL_LINEAR_HF_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "
 
 
 def is_lora_enabled(args: Namespace) -> bool:
-    return args.lora_rank > 0
+    return getattr(args, "lora_rank", 0) > 0
 
 
 def parse_target_modules(value: str | Sequence[str] | None) -> list[str]:
@@ -220,9 +220,7 @@ def export_lora_named_tensors(model: Sequence[torch.nn.Module], args: Namespace)
     return named
 
 
-def build_lora_weight_update_request(
-    args: Namespace, lora_int_id: int, tensor_names: Sequence[str]
-) -> dict[str, Any]:
+def build_lora_weight_update_request(args: Namespace, lora_int_id: int, tensor_names: Sequence[str]) -> dict[str, Any]:
     """Metadata for vLLM's ``start_lora_weight_update`` (#48409).
 
     vime exports the MoE experts as separate per-expert 2D matrices (see the
