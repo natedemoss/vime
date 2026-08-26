@@ -188,3 +188,7 @@ def test_linear_attention_forwards_cu_seqlens_to_chunk_kernel(
     assert output.shape == hidden_states.shape
     assert len(chunk_calls) == 1
     assert torch.equal(chunk_calls[0], cu_seqlens)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

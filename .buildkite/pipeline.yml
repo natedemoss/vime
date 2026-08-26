@@ -92,6 +92,11 @@ steps:
           python tests/test_expert_routing.py
           python tests/test_reloadable_process_group_memory_check.py
           python tests/test_ppo_logprob_entropy.py
+          python tests/test_qwen3_linear_attention_cu_seqlens.py
+          # ~3 min on CPU: the 256x128K cases are dominated by the serial
+          # vanilla_gae reference the parallel scan is checked against.
+          python tests/test_chunked_gae.py
+          python tests/test_ci_test_coverage.py
           python tests/utils/test_hf_checkpoint_saver.py
         '
 
@@ -162,6 +167,7 @@ steps:
             tests/test_qwen3_5_vl_native.py \
             tests/test_read_file_slicing.py \
             tests/test_reloadable_process_group_world.py \
+            tests/test_rollout_metrics.py \
             tests/test_rollout_routing_replay_validation.py \
             tests/test_rollout_sample_hooks.py \
             tests/test_vllm_rollout.py \
