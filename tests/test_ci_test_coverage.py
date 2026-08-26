@@ -139,7 +139,8 @@ def test_bare_python_invocations_have_main_entrypoint() -> None:
     for rel_path in _bare_python_invocations():
         path = REPO_ROOT / rel_path
         assert path.exists(), f".buildkite/pipeline.yml runs {rel_path}, which does not exist."
-        if '__name__ == "__main__"' not in path.read_text(encoding="utf-8"):
+        content = path.read_text(encoding="utf-8")
+        if not re.search(r'__name__\s*==\s*["\']__main__["\']', content):
             no_entrypoint.append(rel_path)
     assert not no_entrypoint, (
         "CI runs these as `python <file>`, but they have no "
