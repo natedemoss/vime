@@ -76,8 +76,13 @@ def _ci_referenced_basenames() -> set[str]:
 
 def _bare_python_invocations() -> list[str]:
     """Repo-relative paths CI runs as ``python <path>`` rather than via pytest."""
-    text = (BUILDKITE_DIR / "pipeline.yml").read_text(encoding="utf-8")
-    return sorted(set(re.findall(r"^\s*python (tests/[\w./-]+\.py)\s*$", text, re.MULTILINE)))
+    lines = []
+    for line in (BUILDKITE_DIR / "pipeline.yml").read_text(encoding="utf-8").splitlines():
+        line = line.split("#")[0].strip()
+        match = re.match(r"^python\s+(tests/[\w./-]+\.py)$", line)
+        if match:
+            lines.append(match.group(1))
+    return sorted(set(lines))
 
 
 def _all_test_files() -> list[str]:
