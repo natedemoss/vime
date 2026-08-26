@@ -66,9 +66,11 @@ def _ci_referenced_basenames() -> set[str]:
     referenced: set[str] = set()
     for ci_file in CI_FILES:
         assert ci_file.exists(), f"CI definition {ci_file} is missing; update CI_FILES."
-        text = ci_file.read_text(encoding="utf-8")
-        for match in re.findall(r"[\w./-]*\btest_[\w.-]*\.py", text):
-            referenced.add(match.rsplit("/", 1)[-1])
+        for line in ci_file.read_text(encoding="utf-8").splitlines():
+            # Ignore comments to avoid matching commented-out tests
+            line = line.split("#")[0]
+            for match in re.findall(r"[\w./-]*\btest_[\w.-]*\.py", line):
+                referenced.add(match.rsplit("/", 1)[-1])
     return referenced
 
 
