@@ -134,7 +134,7 @@ def test_not_run_in_ci_entries_are_actually_uncovered() -> None:
 
 @pytest.mark.unit
 def test_bare_python_invocations_have_main_entrypoint() -> None:
-    """``python tests/foo.py`` runs nothing unless ``foo.py`` calls pytest itself."""
+    """``python tests/foo.py`` runs nothing unless ``foo.py`` has an ``if __name__ == "__main__"`` entrypoint that triggers test execution (often via ``pytest.main``)."""
     no_entrypoint = []
     for rel_path in _bare_python_invocations():
         path = REPO_ROOT / rel_path
