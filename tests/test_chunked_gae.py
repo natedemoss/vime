@@ -61,7 +61,3 @@ def test_gae_parallel_matches_serial(B, T, chunk_size):
     print(f"  Parallel : {parallel_time:.6f} s")
     print(f"  Speedup  : x{serial_time / parallel_time:.2f}")
     print(f"  Max diff adv={adv_err:.3e}, ret={ret_err:.3e}")
-
-
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__]))
