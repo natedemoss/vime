@@ -162,6 +162,8 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
                 )
             multimodal_data = data.get(data_key)
             if multimodal_data is not None:
+                if isinstance(multimodal_data, (str, dict)):
+                    multimodal_data = [multimodal_data]
                 multimodals[mt.placeholder] = (mt, list(multimodal_data))
 
     # Only rows that actually carry media need placeholder substitution. Running
