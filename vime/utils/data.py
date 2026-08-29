@@ -223,10 +223,11 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
 
         if expanded_any:
             for placeholder, (mt, remaining) in multimodals.items():
-                assert len(remaining) == 0, (
-                    f"Multimodal data count mismatch: {len(remaining)} more {mt.name}(s) "
-                    f"than '{placeholder}' placeholders in prompt"
-                )
+                if len(remaining) != 0:
+                    raise AssertionError(
+                        f"Multimodal data count mismatch: {len(remaining)} more {mt.name}(s) "
+                        f"than '{placeholder}' placeholders in prompt"
+                    )
 
     return prompt
 
