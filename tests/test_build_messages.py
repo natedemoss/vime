@@ -53,6 +53,22 @@ def test_media_entries_may_be_rich_dicts():
 
 
 @pytest.mark.unit
+def test_single_media_entry_as_string_or_dict_is_wrapped():
+    # Test single string
+    messages = _build_messages(_row("What is in <image>?", images="a.png"), "text", True, IMAGE_KEYS)
+    assert _content(messages) == [
+        {"type": "text", "text": "What is in "},
+        {"type": "image", "image": "a.png"},
+        {"type": "text", "text": "?"},
+    ]
+
+    # Test single dict
+    item = {"type": "image", "image": "a.png", "max_pixels": 50176}
+    messages = _build_messages(_row("<image> here", images=item), "text", True, IMAGE_KEYS)
+    assert _content(messages) == [item, {"type": "text", "text": " here"}]
+
+
+@pytest.mark.unit
 def test_row_without_media_keeps_its_prompt_intact():
     """A mixed dataset has rows with no media; those prompts must stay intact.
 
